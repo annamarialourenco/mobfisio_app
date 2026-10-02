@@ -6,8 +6,8 @@ import streamlit as st
 import xgboost as xgb
 
 # Limiares operacionais calibrados
-limiar_moderado = 0.25  # 25,0% - Faixa de vigilância
-limiar_critico = 0.38   # 38,0% - Ponto de corte crítico da ML (Sensibilidade de 71,4%)
+limiar_youden = 0.38  # 38,0% - Ponto de corte do modelo (Youden)
+limiar_alto_risco = 0.50  # 50,0% - Alerta crítico de suspensão
 
 # 1. Configuração da Página
 st.set_page_config(
@@ -128,7 +128,7 @@ st.markdown(
 )
 
 
-# 4. Função para Carregar o Modelo Calibrado
+# 4. Função para Carregar o Modelo e Metadados do Dicionário
 @st.cache_resource
 def carregar_modelo():
     pasta_atual = os.path.dirname(os.path.abspath(__file__))
@@ -139,17 +139,21 @@ def carregar_modelo():
     dados_carregados = joblib.load(caminho_modelo)
 
     if isinstance(dados_carregados, dict):
-        for chave in ["model", "modelo", "classifier", "xgb_model"]:
-            if chave in dados_carregados:
-                return dados_carregados[chave]
+        modelo = dados_carregados.get("modelo") or dados_carregados.get("model")
+        limiar = dados_carregados.get("limiar_calibrado", 0.38)
+        features = dados_carregados.get(
+            "features",
+            ["pam_pre", "fc_pre", "fr_pre", "spo2_pre", "dva_em_uso_pre"],
+        )
+    else:
+        modelo = dados_carregados
+        limiar = 0.38
+        features = ["pam_pre", "fc_pre", "fr_pre", "spo2_pre", "dva_em_uso_pre"]
 
-        primeira_chave = list(dados_carregados.keys())[0]
-        return dados_carregados[primeira_chave]
-
-    return dados_carregados
+    return modelo, limiar, features
 
 
-modelo_ssdc = carregar_modelo()
+modelo_ssdc, limiar_calibrado_salvo, features_treino = carregar_modelo()
 
 # 5. Cabeçalho Principal
 st.markdown(
@@ -266,35 +270,42 @@ if st.session_state["foi_calculado"]:
         st.subheader("🛡 Parecer Preditivo de Segurança")
 
         if modelo_ssdc is not None:
+            # Cria o DataFrame garantindo a ordem exata das colunas do treinamento
             dados_paciente = pd.DataFrame(
                 [{
-                    "pam_pre": pam_input,
-                    "fc_pre": fc_input,
-                    "fr_pre": fr_input,
-                    "spo2_pre": spo2_input,
-                    "dva_em_uso_pre": dva_input,
+                    "pam_pre": float(pam_input),
+                    "fc_pre": float(fc_input),
+                    "fr_pre": float(fr_input),
+                    "spo2_pre": float(spo2_input),
+                    "dva_em_uso_pre": float(dva_input),
                 }]
-            )
+            )[features_treino]
 
-            booster = (
-                modelo_ssdc.get_booster()
-                if hasattr(modelo_ssdc, "get_booster")
-                else modelo_ssdc
-            )
-            dmatrix = xgb.DMatrix(dados_paciente)
-            pred_raw = booster.predict(dmatrix)
-            probabilidade = (
-                float(pred_raw[0][1]) if pred_raw.ndim == 2 else float(pred_raw[0])
-            )
+            # Predição da probabilidade
+            if hasattr(modelo_ssdc, "predict_proba"):
+                prob_array = modelo_ssdc.predict_proba(dados_paciente)
+                probabilidade = float(prob_array[0][1])
+            else:
+                booster = (
+                    modelo_ssdc.get_booster()
+                    if hasattr(modelo_ssdc, "get_booster")
+                    else modelo_ssdc
+                )
+                dmatrix = xgb.DMatrix(dados_paciente)
+                pred_raw = booster.predict(dmatrix)
+                probabilidade = (
+                    float(pred_raw[0][1]) if pred_raw.ndim == 2 else float(pred_raw[0])
+                )
+
             prob_percentual = probabilidade * 100
 
-            # Cor da Métrica de Acordo com o Risco
-            if probabilidade >= limiar_critico:
-                cor_metric = "#EF4444"
-            elif probabilidade >= limiar_moderado:
-                cor_metric = "#F59E0B"
+            # Lógica de Cores e Classificação em 3 Zonas
+            if probabilidade < limiar_youden:
+                cor_metric = "#10B981"  # Verde
+            elif limiar_youden <= probabilidade < limiar_alto_risco:
+                cor_metric = "#F59E0B"  # Amarelo
             else:
-                cor_metric = "#10B981"
+                cor_metric = "#EF4444"  # Vermelho
 
             # Hero Metric Card
             st.markdown(
@@ -302,7 +313,7 @@ if st.session_state["foi_calculado"]:
                 <div class="hero-metric-container">
                     <div class="hero-metric-title">Probabilidade Estimada de Instabilidade</div>
                     <div class="hero-metric-value" style="color: {cor_metric};">{prob_percentual:.1f}%</div>
-                    <div class="hero-metric-sub">Ponto de Corte Crítico (ML): 38,0%</div>
+                    <div class="hero-metric-sub">Ponto de Corte Youden (ML): 38,0%</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -311,35 +322,7 @@ if st.session_state["foi_calculado"]:
             st.progress(min(probabilidade, 1.0))
 
             # Card de Conduta Clínica
-            if probabilidade >= limiar_critico:
-                st.markdown(
-                    """
-                    <div class="result-card card-red">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 1.05rem; font-weight: 700; color: #FCA5A5;">🚨 ALERTA DE SEGURANÇA</span>
-                            <span class="status-badge-red">NÍVEL VERMELHO</span>
-                        </div>
-                        <p style="color: #F8FAFC; margin-bottom: 6px;"><b>Risco Elevado de Instabilidade Hemodinâmica ou Respiratória.</b></p>
-                        <p style="color: #CBD5E1; font-size: 0.9rem; margin: 0;"><b>Recomendação:</b> Suspender a mobilização no momento ($t_0$), reavaliar parâmetros hemodinâmicos e alinhar conduta com a equipe multiprofissional.</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            elif probabilidade >= limiar_moderado:
-                st.markdown(
-                    """
-                    <div class="result-card card-yellow">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 1.05rem; font-weight: 700; color: #FDE68A;">⚠️ ATENÇÃO REQUERIDA</span>
-                            <span class="status-badge-yellow">NÍVEL AMARELO</span>
-                        </div>
-                        <p style="color: #F8FAFC; margin-bottom: 6px;"><b>Risco Moderado de Instabilidade (Faixa de Vigilância).</b></p>
-                        <p style="color: #CBD5E1; font-size: 0.9rem; margin: 0;"><b>Recomendação:</b> Proceder com mobilização adaptada/passiva no leito sob monitorização rigorosa e vigilância contínua dos sinais vitais.</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            else:
+            if probabilidade < limiar_youden:
                 st.markdown(
                     """
                     <div class="result-card card-green">
@@ -349,6 +332,34 @@ if st.session_state["foi_calculado"]:
                         </div>
                         <p style="color: #F8FAFC; margin-bottom: 6px;"><b>Paciente em Faixa Segura de Estabilidade.</b></p>
                         <p style="color: #CBD5E1; font-size: 0.9rem; margin: 0;"><b>Recomendação:</b> Proceder com o protocolo de mobilização precoce habitual sob monitorização padrão à beira do leito.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            elif limiar_youden <= probabilidade < limiar_alto_risco:
+                st.markdown(
+                    """
+                    <div class="result-card card-yellow">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <span style="font-size: 1.05rem; font-weight: 700; color: #FDE68A;">⚠️ ATENÇÃO REQUERIDA</span>
+                            <span class="status-badge-yellow">NÍVEL AMARELO</span>
+                        </div>
+                        <p style="color: #F8FAFC; margin-bottom: 6px;"><b>Risco Moderado de Instabilidade (Faixa de Vigilância).</b></p>
+                        <p style="color: #CBD5E1; font-size: 0.9rem; margin: 0;"><b>Recomendação:</b> Proceder com mobilização adaptada/passiva sob monitorização contínua de SpO₂ e PAM durante a conduta.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    """
+                    <div class="result-card card-red">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <span style="font-size: 1.05rem; font-weight: 700; color: #FCA5A5;">🚨 ALERTA DE SEGURANÇA</span>
+                            <span class="status-badge-red">NÍVEL VERMELHO</span>
+                        </div>
+                        <p style="color: #F8FAFC; margin-bottom: 6px;"><b>Risco Elevado de Instabilidade Hemodinâmica ou Respiratória.</b></p>
+                        <p style="color: #CBD5E1; font-size: 0.9rem; margin: 0;"><b>Recomendação:</b> Suspender ou adiar a mobilização no momento ($t_0$), reavaliar parâmetros hemodinâmicos e alinhar conduta com a equipe multiprofissional.</p>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -374,10 +385,10 @@ st.divider()
 with st.expander("ℹ️ Entenda a Lógica de Decisão do SSDC MobFisio IA"):
     st.write(
         """
-        - **Estratificação de Risco por Faixas:**
-          - 🟩 **Risco Baixo (< 25,0%):** Liberação padrão para o protocolo de mobilização precoce.
-          - 🟨 **Risco Moderado (25,0% - 37,9%):** Zona de vigilância prévia. Requer adaptação da intensidade da conduta.
-          - 🟥 **Risco Crítico (≥ 38,0%):** Limiar operacional calibrado no modelo para maximizar a Sensibilidade (71,4%). Contraindicação temporária ($t_0$).
+        - **Estratificação de Risco por Faixas Operacionais:**
+          - 🟩 **Risco Baixo (< 38,0%):** Probabilidade abaixo do limiar calibrado. Liberação padrão para o protocolo de mobilização precoce.
+          - 🟨 **Risco Moderado / Atenção (38,0% - 49,9%):** Faixa de vigilância correspondente ao risco basal de mobilização em UTI. Autorizado mediante monitorização rigorosa e conduta adaptada.
+          - 🟥 **Risco Crítico (≥ 50,0%):** Probabilidade expressiva de intercorrência. Recomendação de adiar ou reavaliar antes da conduta ($t_0$).
         - **Peso dos Sinais Vitais:** A Pressão Arterial Média (PAM) representa **60,7%** do peso na árvore do XGBoost, seguida pelo uso de DVA e Frequência Respiratória.
         """
     )
